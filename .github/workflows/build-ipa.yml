@@ -1,0 +1,96 @@
+name: Test and build unsigned iOS IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    runs-on: xcode-27
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Select Xcode 27.0
+        run: sudo xcode-select -s /Applications/Xcode_27.app/Contents/Developer
+      - name: Generate project and synthetic test audio
+        run: |
+          set -euo pipefail
+          mkdir -p build/private-logs artifacts
+          if ! bash -e -o pipefail >build/private-logs/setup.log 2>&1 <<'SETUP'
+            command -v xcodegen >/dev/null || brew install xcodegen
+            command -v ffmpeg >/dev/null || brew install ffmpeg
+            python3 scripts/generate_probe.py
+            python3 scripts/generate_icon.py
+            python3 scripts/generate_fixtures.py
+            bash scripts/build_opus.sh
+            xcodegen generate
+          SETUP
+          then
+            echo 'Project, fixture, or codec setup failed.'
+            exit 1
+          fi
+          xcodebuild -version
+          xcodegen --version
+          ffmpeg -version | sed -n '1p'
+      - name: Run unit and UI tests on iOS 27
+        run: |
+          set -euo pipefail
+          DEVICE=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin); candidates=[x for runtime,v in d["devices"].items() if "iOS-27-0" in runtime for x in v if "iPhone" in x["name"]]; candidates.sort(key=lambda x:(x["name"]!="iPhone 17",x["name"])); sys.exit("No available iOS 27.0 iPhone simulator") if not candidates else print(candidates[0]["udid"])')
+          if ! xcrun simctl bootstatus "$DEVICE" -b >build/private-logs/simulator.log 2>&1; then
+            echo 'Could not boot the iOS simulator.'
+            exit 1
+          fi
+          if ! xcodebuild -project SimpleMusic.xcodeproj -scheme SimpleMusic \
+            -configuration Release -destination "platform=iOS Simulator,id=$DEVICE" \
+            -derivedDataPath build/simulator -resultBundlePath build/tests.xcresult \
+            -parallel-testing-enabled NO -skip-testing:SimpleMusicUITests/NativeControlUITests \
+            ENABLE_TESTABILITY=YES CODE_SIGNING_ALLOWED=YES CODE_SIGN_IDENTITY=- \
+            test >build/private-logs/test.log 2>&1; then
+            python3 scripts/check_public_build.py diagnostics build/private-logs/test.log
+            exit 1
+          fi
+          xcrun xcresulttool get test-results summary --path build/tests.xcresult >build/test-summary.json
+      - name: Build ARM64 device app without signing
+        run: |
+          set -euo pipefail
+          if ! xcodebuild -project SimpleMusic.xcodeproj -scheme SimpleMusic \
+            -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath build/device CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY='' build >build/private-logs/device.log 2>&1; then
+            python3 scripts/check_public_build.py diagnostics build/private-logs/device.log
+            exit 1
+          fi
+      - name: Verify and package the unsigned app
+        run: |
+          set -euo pipefail
+          APP=build/device/Build/Products/Release-iphoneos/SimpleMusic.app
+          lipo "$APP/SimpleMusic" -verify_arch arm64
+          lipo "$APP/PlugIns/SimpleMusicControls.appex/SimpleMusicControls" -verify_arch arm64
+          if codesign --verify --deep --strict "$APP" >build/private-logs/signature.log 2>&1; then
+            echo 'Unexpected signed device app.'
+            exit 1
+          fi
+          grep -q 'not signed at all' build/private-logs/signature.log
+          mkdir -p build/package/Payload
+          ditto "$APP" build/package/Payload/SimpleMusic.app
+          (cd build/package && zip -q -r ../../artifacts/SimpleMusic-unsigned.ipa Payload)
+          python3 scripts/check_public_build.py verify artifacts build/test-summary.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: SimpleMusic-unsigned-ipa
+          path: |
+            artifacts/SimpleMusic-unsigned.ipa
+            artifacts/SHA256SUMS.txt
+            artifacts/test-summary.json
+            artifacts/ThirdPartyNotices.txt
+          if-no-files-found: error
+          retention-days: 7
