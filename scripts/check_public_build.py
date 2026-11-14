@@ -91,10 +91,7 @@ def verify_ipa(path, notices):
             raise VerificationError("IPA is missing required notices or the generated audio fixture.")
 
 
-def verify_build(artifacts, raw_summary):
-    notices = (artifacts / "ThirdPartyNotices.txt").read_bytes()
-    if not all(f"===== {name} =====".encode() in notices for name in COPYING):
-        raise VerificationError("The third-party notices are incomplete.")
+def test_summary(raw_summary):
     summary = json.loads(raw_summary.read_text(encoding="utf-8"))
     safe_summary = {key: summary[key] for key in SUMMARY_FIELDS if key in summary}
     if (
@@ -103,6 +100,14 @@ def verify_build(artifacts, raw_summary):
         or safe_summary.get("failedTests", -1) != 0
     ):
         raise VerificationError("Test results are missing or unsuccessful.")
+    return safe_summary
+
+
+def verify_build(artifacts, raw_summary):
+    notices = (artifacts / "ThirdPartyNotices.txt").read_bytes()
+    if not all(f"===== {name} =====".encode() in notices for name in COPYING):
+        raise VerificationError("The third-party notices are incomplete.")
+    safe_summary = test_summary(raw_summary)
     ipa = artifacts / "SimpleMusic-unsigned.ipa"
     verify_ipa(ipa, notices)
     digest = hashlib.sha256(ipa.read_bytes()).hexdigest()
@@ -133,16 +138,20 @@ def main():
     verify.add_argument("summary", type=Path)
     report = subparsers.add_parser("diagnostics")
     report.add_argument("log", type=Path)
+    summary = subparsers.add_parser("summary")
+    summary.add_argument("summary", type=Path)
     args = parser.parse_args()
-    if args.command == "diagnostics":
-        diagnostics(args.log)
-    else:
-        try:
+    try:
+        if args.command == "diagnostics":
+            diagnostics(args.log)
+        elif args.command == "summary":
+            print(json.dumps(test_summary(args.summary), sort_keys=True))
+        else:
             verify_build(args.artifacts, args.summary)
-        except VerificationError as error:
-            raise SystemExit(str(error)) from None
-        except Exception:
-            raise SystemExit("Public artifact verification could not read the expected build output.") from None
+    except VerificationError as error:
+        raise SystemExit(str(error)) from None
+    except Exception:
+        raise SystemExit("Public artifact verification could not read the expected build output.") from None
 
 
 if __name__ == "__main__":

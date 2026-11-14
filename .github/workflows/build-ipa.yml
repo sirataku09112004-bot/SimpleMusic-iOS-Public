@@ -14,7 +14,7 @@ jobs:
   build:
     if: github.ref == 'refs/heads/main'
     runs-on: xcode-27
-    timeout-minutes: 20
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -59,6 +59,7 @@ jobs:
             exit 1
           fi
           xcrun xcresulttool get test-results summary --path build/tests.xcresult >build/test-summary.json
+          python3 scripts/check_public_build.py summary build/test-summary.json
       - name: Build ARM64 device app without signing
         run: |
           set -euo pipefail
